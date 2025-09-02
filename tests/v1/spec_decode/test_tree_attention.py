@@ -50,6 +50,7 @@ def forward_attention(
         dtype=torch.int32,
     )
     context_lens = seq_lens - query_lens
+    max_seq_len = int(seq_lens.max())
     max_query_len = q_len
     num_actual_tokens = query_start_loc[-1]
 
@@ -81,6 +82,7 @@ def forward_attention(
         num_reqs=batch_size,
         num_actual_tokens=num_actual_tokens,
         max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
     )
@@ -155,7 +157,7 @@ def test_tree_attn_correctness() -> None:
 
     dim_per_head = 128
     num_kv_heads = 2
-    block_size = 128
+    block_size = 32
     max_sequence_length = 8192
     randomize_blocks = True
     for batch_size in [1, 16, 32]:
