@@ -40,7 +40,9 @@ from vllm.utils import (direct_register_custom_op, has_deep_ep, has_pplx,
 
 if current_platform.is_cuda_alike():
     from .fused_batched_moe import BatchedTritonExperts
-    from .fused_moe import TritonExperts, fused_experts
+    from .fused_moe import TritonExperts
+    # from .fused_moe import fused_experts
+    from .fused_moe import flux_fused_experts as fused_experts
     if has_pplx():
         from .pplx_prepare_finalize import (PplxPrepareAndFinalize,
                                             pplx_hidden_dim_scale_bytes)
@@ -481,6 +483,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_load_view=expert_load_view,
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count)
+        
+        self.fused_experts = None # enforce flux fused moe
 
         if self.rocm_aiter_moe_enabled:
             return self.rocm_aiter_fused_experts(
