@@ -41,7 +41,7 @@ from vllm.utils import (direct_register_custom_op, has_deep_ep, has_pplx,
 if current_platform.is_cuda_alike():
     from .fused_batched_moe import BatchedTritonExperts
     from .fused_moe import TritonExperts
-    # from .fused_moe import fused_experts
+    #from .fused_moe import fused_experts
     from .fused_moe import flux_fused_experts as fused_experts
     if has_pplx():
         from .pplx_prepare_finalize import (PplxPrepareAndFinalize,

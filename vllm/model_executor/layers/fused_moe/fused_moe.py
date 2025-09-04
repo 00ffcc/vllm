@@ -1760,7 +1760,7 @@ def flux_fused_experts(
     assert hidden_states.dtype in [
         torch.float32, torch.float16, torch.bfloat16
     ]
-    assert inplace == False, "Flux fused_moe only supports outplace mode for now."
+    #assert inplace == False, "Flux fused_moe only supports outplace mode for now."
 
     num_tokens = hidden_states.size(0)
     E, N, _ = w1.size()
@@ -1777,7 +1777,8 @@ def flux_fused_experts(
     tp_group = get_tp_group()
     dp_group = get_dp_group()
     ep_group = get_ep_group()
-
+    print(f"{tp_group.device_group=} {dp_group.device_group=} {ep_group.device_group=}")
+    flux.init_flux_shm(dp_group.device_group) # TODO
     RANK = dp_group.rank
     WORLD_SIZE = dp_group.world_size
 
@@ -1790,7 +1791,7 @@ def flux_fused_experts(
     assert tp_group.world_size == 1, "TP_SIZE must be 1"
     assert E == global_num_experts // ep_size, "E must be equal to global_num_experts / EP_SIZE"
 
-    tp_env = flux.DistEnvTPWithEP(tp_group=dp_group, nnodes=1, ep_group=ep_group) # https://github.com/bytedance/flux/issues/110 only for TP_SIZE = 1
+    tp_env = flux.DistEnvTPWithEP(tp_group=dp_group.device_group, nnodes=1, ep_group=ep_group.device_group) # https://github.com/bytedance/flux/issues/110 only for TP_SIZE = 1
     flux_m_max = M * top_k_num
     moe_args = flux.MoeArguments(
         max_ntokens=num_tokens,
