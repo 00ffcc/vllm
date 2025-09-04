@@ -1748,6 +1748,10 @@ def flux_fused_experts(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    w1: [num_experts, 2 * intermediate_size_per_partition, hidden_size] (w13)
+    w2: [num_experts, hidden_size, intermediate_size_per_partition]
+    """
     import flux
     # Check constraints.
     assert hidden_states.size(1) == w1.size(2), (
@@ -1784,7 +1788,9 @@ def flux_fused_experts(
     ep_size = ep_group.world_size
     ep_rank = ep_group.rank
     ffn_tp_size = WORLD_SIZE // ep_size
-    ffn_size_shard = K // ffn_tp_size
+
+    intermediate_size_per_partition = w2.size(2)
+    assert intermediate_size_per_partition == w1.size(1) // (2 if is_act_and_mul else 1), f"intermediate_size_per_partition mismatch. {intermediate_size_per_partition=} {w1.shape=} {w2.shape=}"
 
     assert ep_group.world_size == dp_group.world_size, "EP_SIZE must be equal to DP_SIZE" # TODO: support EP_SIZE < DP_SIZE
     assert tp_group.world_size == 1, "TP_SIZE must be 1"
@@ -1824,7 +1830,8 @@ def flux_fused_experts(
     data_type = hidden_states.dtype
     nexperts_ep = global_num_experts // ep_size
     nrows_ep = torch.sum(splits_gpu[nexperts_ep * ep_rank : nexperts_ep * (ep_rank + 1)]).item()
-    intermediate_output = torch.zeros((nrows_ep, ffn_size_shard), dtype=data_type, device=device)
+    intermediate_output = torch.zeros((nrows_ep, intermediate_size_per_partition * (2 if is_act_and_mul else 1)), dtype=data_type, device=device)
+    intermediate_output1 = torch.zeros((nrows_ep, intermediate_size_per_partition), dtype=data_type, device=device)
     flux_ag_op.forward(
             inputs_shard=hidden_states,
             weights=w1,
@@ -1833,23 +1840,23 @@ def flux_fused_experts(
             outputs_buf=intermediate_output,
         )
     if activation == "silu" and is_act_and_mul:
-        torch.ops._C.silu_and_mul(intermediate_output, intermediate_output) # TODO ok?
+        torch.ops._C.silu_and_mul(intermediate_output1, intermediate_output)
     elif activation == "gelu" and is_act_and_mul:
-        torch.ops._C.gelu_and_mul(intermediate_output, intermediate_output)
+        torch.ops._C.gelu_and_mul(intermediate_output1, intermediate_output)
     elif activation == "swigluoai" and is_act_and_mul:
         # alpha = 1.702, limit = 7.0
-        torch.ops._C.swigluoai_and_mul(intermediate_output, intermediate_output)
+        torch.ops._C.swigluoai_and_mul(intermediate_output1, intermediate_output)
     # Activation function without multiplication
     elif activation == "silu":
-        intermediate_output = torch.nn.functional.silu(intermediate_output)
+        intermediate_output1 = torch.nn.functional.silu(intermediate_output)
     elif activation == "gelu":
-        intermediate_output = torch.nn.functional.gelu(intermediate_output)
+        intermediate_output1 = torch.nn.functional.gelu(intermediate_output)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}, "
                          f"with is_act_and_mul={is_act_and_mul}.")
     
     output = flux_rs_op.forward_gather_rs(
-            input=intermediate_output,
+            input=intermediate_output1,
             weight=w2,
             splits_cpu=splits_cpu,
             scatter_idx=scatter_index.view(-1),
