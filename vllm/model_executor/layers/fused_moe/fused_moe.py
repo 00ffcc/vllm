@@ -1752,6 +1752,8 @@ def flux_fused_experts(
     w1: [num_experts, 2 * intermediate_size_per_partition, hidden_size] (w13)
     w2: [num_experts, hidden_size, intermediate_size_per_partition]
     """
+    print(f"{w1.shape=} {w2.shape=} {hidden_states.shape=}")
+
     import flux
     # Check constraints.
     assert hidden_states.size(1) == w1.size(2), (
@@ -1802,7 +1804,7 @@ def flux_fused_experts(
     moe_args = flux.MoeArguments(
         max_ntokens=num_tokens,
         hidden=hidden_states.size(1),
-        ffn_hidden=w1.size(2),
+        ffn_hidden=w1.size(1) * tp_group.world_size,
         nexperts=global_num_experts,
         topk=top_k_num,
         input_dtype=hidden_states.dtype,
