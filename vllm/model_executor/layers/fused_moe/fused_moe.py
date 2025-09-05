@@ -1825,9 +1825,12 @@ def flux_fused_experts(
         1,
     )
 
-    splits_gpu = torch.bincount(topk_ids.view(-1), minlength=global_num_experts).to(torch.int32)
+    global_topk_ids = dp_group.all_gather(topk_ids)
+    global_topk_weights = dp_group.all_gather(topk_weights)
+
+    splits_gpu = torch.bincount(global_topk_ids.view(-1), minlength=global_num_experts).to(torch.int32)
     splits_cpu = splits_gpu.cpu()
-    scatter_index = flux.calc_scatter_index(topk_ids, splits_gpu)
+    scatter_index = flux.calc_scatter_index(global_topk_ids, splits_gpu)
 
     device = torch.cuda.current_device()
     data_type = hidden_states.dtype
@@ -1835,6 +1838,11 @@ def flux_fused_experts(
     nrows_ep = torch.sum(splits_gpu[nexperts_ep * ep_rank : nexperts_ep * (ep_rank + 1)]).item()
     intermediate_output = torch.zeros((nrows_ep, intermediate_size_per_partition * (2 if is_act_and_mul else 1)), dtype=data_type, device=device)
     intermediate_output1 = torch.zeros((nrows_ep, intermediate_size_per_partition), dtype=data_type, device=device)
+
+    global_output_vec_scales = torch.zeros((global_topk_ids.numel(),), dtype=data_type, device=device)
+    global_output_vec_scales.scatter_(0, scatter_index.view(-1), global_topk_weights.view(-1))
+    output_vec_scales = global_output_vec_scales[torch.sum(splits_gpu[:nexperts_ep * ep_rank]) : torch.sum(splits_gpu[:nexperts_ep * (ep_rank + 1)])]
+
     flux_ag_op.forward(
             inputs_shard=hidden_states,
             weights=w1,
@@ -1863,6 +1871,7 @@ def flux_fused_experts(
             weight=w2,
             splits_cpu=splits_cpu,
             scatter_idx=scatter_index.view(-1),
+            output_vec_scales=output_vec_scales,
         )
     return output
 
