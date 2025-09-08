@@ -1787,6 +1787,7 @@ def flux_fused_experts(
     flux.init_flux_shm(dp_group.device_group) # TODO
     RANK = dp_group.rank
     WORLD_SIZE = dp_group.world_size
+    print(f"{dp_group.rank=} {dp_group.world_size=}")
 
     ep_size = ep_group.world_size
     ep_rank = ep_group.rank
@@ -1800,7 +1801,7 @@ def flux_fused_experts(
     assert E == global_num_experts // ep_size, "E must be equal to global_num_experts / EP_SIZE"
 
     tp_env = flux.DistEnvTPWithEP(tp_group=dp_group.device_group, nnodes=1, ep_group=ep_group.device_group) # https://github.com/bytedance/flux/issues/110 only for TP_SIZE = 1
-    flux_m_max = M * top_k_num
+    flux_m_max = M * top_k_num * WORLD_SIZE
     moe_args = flux.MoeArguments(
         max_ntokens=num_tokens,
         hidden=hidden_states.size(1),
@@ -1825,8 +1826,9 @@ def flux_fused_experts(
         1,
     )
 
-    global_topk_ids = dp_group.all_gather(topk_ids)
-    global_topk_weights = dp_group.all_gather(topk_weights)
+    global_topk_ids = dp_group.all_gather(topk_ids, dim=0)
+    global_topk_weights = dp_group.all_gather(topk_weights, dim=0)
+    print(f"{topk_ids.shape} {global_topk_ids.shape}")
 
     splits_gpu = torch.bincount(global_topk_ids.view(-1), minlength=global_num_experts).to(torch.int32)
     splits_cpu = splits_gpu.cpu()
@@ -1839,7 +1841,7 @@ def flux_fused_experts(
     intermediate_output = torch.zeros((nrows_ep, intermediate_size_per_partition * (2 if is_act_and_mul else 1)), dtype=data_type, device=device)
     intermediate_output1 = torch.zeros((nrows_ep, intermediate_size_per_partition), dtype=data_type, device=device)
 
-    global_output_vec_scales = torch.zeros((global_topk_ids.numel(),), dtype=data_type, device=device)
+    global_output_vec_scales = torch.zeros((global_topk_ids.numel(),), dtype=global_topk_weights.dtype, device=device)
     global_output_vec_scales.scatter_(0, scatter_index.view(-1), global_topk_weights.view(-1))
     output_vec_scales = global_output_vec_scales[torch.sum(splits_gpu[:nexperts_ep * ep_rank]) : torch.sum(splits_gpu[:nexperts_ep * (ep_rank + 1)])]
 
@@ -1870,8 +1872,8 @@ def flux_fused_experts(
             input=intermediate_output1,
             weight=w2,
             splits_cpu=splits_cpu,
-            scatter_idx=scatter_index.view(-1),
-            output_vec_scales=output_vec_scales,
+            routing_idx=scatter_index.flatten(),
+            output_vec_scale=output_vec_scales,
         )
     return output
 
