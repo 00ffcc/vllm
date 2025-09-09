@@ -1720,162 +1720,180 @@ def fused_experts_impl(
 
     return out_hidden_states
 
-def flux_fused_experts(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    inplace: bool = False,
-    activation: str = "silu",
-    is_act_and_mul: bool = True,
-    apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    use_mxfp4_w4a4: bool = False,
-    per_channel_quant: bool = False,
-    global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    w1: [num_experts, 2 * intermediate_size_per_partition, hidden_size] (w13)
-    w2: [num_experts, hidden_size, intermediate_size_per_partition]
-    """
-    print(f"{w1.shape=} {w2.shape=} {hidden_states.shape=}")
+class FluxFusedExperts(torch.nn.Module):
 
-    import flux
-    # Check constraints.
-    assert hidden_states.size(1) == w1.size(2), (
-            f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}")
-
-    assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
-    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert hidden_states.dtype in [
-        torch.float32, torch.float16, torch.bfloat16
-    ]
-    #assert inplace == False, "Flux fused_moe only supports outplace mode for now."
-
-    num_tokens = hidden_states.size(0)
-    E, N, _ = w1.size()
-    K = w2.size(1)
-    if global_num_experts == -1:
-        global_num_experts = E
-    top_k_num = topk_ids.size(1)
-    # We execute the fused_moe kernel in chunks to circumvent this issue:
-    # https://github.com/vllm-project/vllm/issues/5938
-    M = num_tokens
-
-    from vllm.distributed.parallel_state import get_dp_group, get_tp_group, get_ep_group
-
-    tp_group = get_tp_group()
-    dp_group = get_dp_group()
-    ep_group = get_ep_group()
-    print(f"{tp_group.device_group=} {dp_group.device_group=} {ep_group.device_group=}")
-    flux.init_flux_shm(dp_group.device_group) # TODO
-    RANK = dp_group.rank
-    WORLD_SIZE = dp_group.world_size
-    print(f"{dp_group.rank=} {dp_group.world_size=}")
-
-    ep_size = ep_group.world_size
-    ep_rank = ep_group.rank
-    ffn_tp_size = WORLD_SIZE // ep_size
-
-    intermediate_size_per_partition = w2.size(2)
-    assert intermediate_size_per_partition == w1.size(1) // (2 if is_act_and_mul else 1), f"intermediate_size_per_partition mismatch. {intermediate_size_per_partition=} {w1.shape=} {w2.shape=}"
-
-    assert ep_group.world_size == dp_group.world_size, "EP_SIZE must be equal to DP_SIZE" # TODO: support EP_SIZE < DP_SIZE
-    assert tp_group.world_size == 1, "TP_SIZE must be 1"
-    assert E == global_num_experts // ep_size, "E must be equal to global_num_experts / EP_SIZE"
-
-    tp_env = flux.DistEnvTPWithEP(tp_group=dp_group.device_group, nnodes=1, ep_group=ep_group.device_group) # https://github.com/bytedance/flux/issues/110 only for TP_SIZE = 1
-    flux_m_max = M * top_k_num * WORLD_SIZE
-    moe_args = flux.MoeArguments(
-        max_ntokens=num_tokens,
-        hidden=hidden_states.size(1),
-        ffn_hidden=w1.size(1) * tp_group.world_size,
-        nexperts=global_num_experts,
-        topk=top_k_num,
-        input_dtype=hidden_states.dtype,
-        output_dtype=hidden_states.dtype,
-    )
-
-    assert flux.util.get_arch() >= 90, "Only for Hoper or newer GPU"
-    flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=moe_args)
-    flux_rs_op = flux.GemmGroupedV3GatherRS(
+    def __init__(
+        self,
         global_num_experts,
-        flux_m_max,
-        hidden_states.size(1),
         top_k_num,
-        RANK,
-        WORLD_SIZE,
-        ffn_tp_size,
-        ep_size,
-        1,
-    )
+        max_num_tokens,
+        hidden_size,
+        intermediate_size,
+        dtype,
+    ):
+        super().__init__()
 
-    global_topk_ids = dp_group.all_gather(topk_ids, dim=0)
-    global_topk_weights = dp_group.all_gather(topk_weights, dim=0)
-    print(f"{topk_ids.shape} {global_topk_ids.shape}")
+        import flux
+        from vllm.distributed.parallel_state import get_dp_group, get_tp_group, get_ep_group
 
-    splits_gpu = torch.bincount(global_topk_ids.view(-1), minlength=global_num_experts).to(torch.int32)
-    splits_cpu = splits_gpu.cpu()
-    scatter_index = flux.calc_scatter_index(global_topk_ids, splits_gpu)
+        tp_group = get_tp_group()
+        dp_group = get_dp_group()
+        ep_group = get_ep_group()
+        self.tp_group = tp_group
+        self.dp_group = dp_group
+        self.ep_group = ep_group
+        flux.init_flux_shm(dp_group.device_group)
+        RANK = dp_group.rank
+        WORLD_SIZE = dp_group.world_size
 
-    device = torch.cuda.current_device()
-    data_type = hidden_states.dtype
-    nexperts_ep = global_num_experts // ep_size
-    nrows_ep = torch.sum(splits_gpu[nexperts_ep * ep_rank : nexperts_ep * (ep_rank + 1)]).item()
-    intermediate_output = torch.zeros((nrows_ep, intermediate_size_per_partition * (2 if is_act_and_mul else 1)), dtype=data_type, device=device)
-    intermediate_output1 = torch.zeros((nrows_ep, intermediate_size_per_partition), dtype=data_type, device=device)
+        ep_size = ep_group.world_size
+        ep_rank = ep_group.rank
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        ffn_tp_size = WORLD_SIZE // ep_size
 
-    global_output_vec_scales = torch.zeros((global_topk_ids.numel(),), dtype=global_topk_weights.dtype, device=device)
-    global_output_vec_scales.scatter_(0, scatter_index.view(-1), global_topk_weights.view(-1))
-    output_vec_scales = global_output_vec_scales[torch.sum(splits_gpu[:nexperts_ep * ep_rank]) : torch.sum(splits_gpu[:nexperts_ep * (ep_rank + 1)])]
+        assert ep_group.world_size == dp_group.world_size, "EP_SIZE must be equal to DP_SIZE" # TODO: support EP_SIZE < DP_SIZE
+        assert tp_group.world_size == 1, "TP_SIZE must be 1"
 
-    flux_ag_op.forward(
-            inputs_shard=hidden_states,
-            weights=w1,
-            splits_gpu=splits_gpu,
-            scatter_index=scatter_index,
-            outputs_buf=intermediate_output,
+        tp_env = flux.DistEnvTPWithEP(tp_group=dp_group.device_group, nnodes=1, ep_group=ep_group.device_group) # https://github.com/bytedance/flux/issues/110 only for TP_SIZE = 1
+        flux_m_max = max_num_tokens * top_k_num * WORLD_SIZE
+        moe_args = flux.MoeArguments(
+            max_ntokens=max_num_tokens,
+            hidden=hidden_size,
+            ffn_hidden=intermediate_size * 2, # w13, act + mul
+            nexperts=global_num_experts,
+            topk=top_k_num,
+            input_dtype=dtype,
+            output_dtype=dtype,
         )
-    if activation == "silu" and is_act_and_mul:
-        torch.ops._C.silu_and_mul(intermediate_output1, intermediate_output)
-    elif activation == "gelu" and is_act_and_mul:
-        torch.ops._C.gelu_and_mul(intermediate_output1, intermediate_output)
-    elif activation == "swigluoai" and is_act_and_mul:
-        # alpha = 1.702, limit = 7.0
-        torch.ops._C.swigluoai_and_mul(intermediate_output1, intermediate_output)
-    # Activation function without multiplication
-    elif activation == "silu":
-        intermediate_output1 = torch.nn.functional.silu(intermediate_output)
-    elif activation == "gelu":
-        intermediate_output1 = torch.nn.functional.gelu(intermediate_output)
-    else:
-        raise ValueError(f"Unsupported FusedMoe activation: {activation}, "
-                         f"with is_act_and_mul={is_act_and_mul}.")
-    
-    output = flux_rs_op.forward_gather_rs(
-            input=intermediate_output1,
-            weight=w2,
-            splits_cpu=splits_cpu,
-            routing_idx=scatter_index.flatten(),
-            output_vec_scale=output_vec_scales,
+
+        assert flux.util.get_arch() >= 90, "Only for Hoper or newer GPU"
+        self.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=moe_args)
+        self.flux_rs_op = flux.GemmGroupedV3GatherRS(
+            global_num_experts,
+            flux_m_max,
+            hidden_size,
+            top_k_num,
+            RANK,
+            WORLD_SIZE,
+            ffn_tp_size,
+            ep_size,
+            1,
         )
-    return output
+        
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        inplace: bool = False,
+        activation: str = "silu",
+        is_act_and_mul: bool = True,
+        apply_router_weight_on_input: bool = False,
+        use_fp8_w8a8: bool = False,
+        use_int8_w8a8: bool = False,
+        use_int8_w8a16: bool = False,
+        use_int4_w4a16: bool = False,
+        use_mxfp4_w4a4: bool = False,
+        per_channel_quant: bool = False,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        w1_scale: Optional[torch.Tensor] = None,
+        w2_scale: Optional[torch.Tensor] = None,
+        w1_zp: Optional[torch.Tensor] = None,
+        w2_zp: Optional[torch.Tensor] = None,
+        a1_scale: Optional[torch.Tensor] = None,
+        a2_scale: Optional[torch.Tensor] = None,
+        block_shape: Optional[list[int]] = None,
+        w1_bias: Optional[torch.Tensor] = None,
+        w2_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        w1: [num_experts, 2 * intermediate_size_per_partition, hidden_size] (w13)
+        w2: [num_experts, hidden_size, intermediate_size_per_partition]
+        """
+
+        
+        # Check constraints.
+        assert hidden_states.size(1) == w1.size(2), (
+                f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}")
+
+        assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
+        assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+        assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
+        assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
+        assert hidden_states.dtype in [
+            torch.float32, torch.float16, torch.bfloat16
+        ]
+        assert intermediate_size == True, "intermediate_size must be True"
+        #assert inplace == False, "Flux fused_moe only supports outplace mode for now."
+
+        num_tokens = hidden_states.size(0)
+        E, N, _ = w1.size()
+        K = w2.size(1)
+        if global_num_experts == -1:
+            global_num_experts = E
+        top_k_num = topk_ids.size(1)
+        # We execute the fused_moe kernel in chunks to circumvent this issue:
+        # https://github.com/vllm-project/vllm/issues/5938
+        M = num_tokens
+
+        intermediate_size_per_partition = w2.size(2)
+        assert intermediate_size_per_partition == w1.size(1) // (2 if is_act_and_mul else 1), f"intermediate_size_per_partition mismatch. {intermediate_size_per_partition=} {w1.shape=} {w2.shape=}"
+        
+        global_topk_ids = self.dp_group.all_gather(topk_ids, dim=0)
+        global_topk_weights = self.dp_group.all_gather(topk_weights, dim=0)
+
+        splits_gpu = torch.bincount(global_topk_ids.view(-1), minlength=global_num_experts).to(torch.int32)
+        splits_cpu = splits_gpu.cpu()
+        import flux
+        scatter_index = flux.calc_scatter_index(global_topk_ids, splits_gpu)
+
+        device = torch.cuda.current_device()
+        data_type = hidden_states.dtype
+        nexperts_ep = global_num_experts // self.ep_size
+        nrows_ep = torch.sum(splits_gpu[nexperts_ep * self.ep_rank : nexperts_ep * (self.ep_rank + 1)]).item()
+        intermediate_output = torch.zeros((nrows_ep, intermediate_size_per_partition * (2 if is_act_and_mul else 1)), dtype=data_type, device=device)
+        intermediate_output1 = torch.zeros((nrows_ep, intermediate_size_per_partition), dtype=data_type, device=device)
+
+        global_output_vec_scales = torch.zeros((global_topk_ids.numel(),), dtype=global_topk_weights.dtype, device=device)
+        global_output_vec_scales.scatter_(0, scatter_index.view(-1), global_topk_weights.view(-1))
+        output_vec_scales = global_output_vec_scales[torch.sum(splits_gpu[:nexperts_ep * self.ep_rank]) : torch.sum(splits_gpu[:nexperts_ep * (self.ep_rank + 1)])]
+
+        self.flux_ag_op.forward(
+                inputs_shard=hidden_states,
+                weights=w1,
+                splits_gpu=splits_gpu,
+                scatter_index=scatter_index,
+                outputs_buf=intermediate_output,
+            )
+        if activation == "silu" and is_act_and_mul:
+            torch.ops._C.silu_and_mul(intermediate_output1, intermediate_output)
+        elif activation == "gelu" and is_act_and_mul:
+            torch.ops._C.gelu_and_mul(intermediate_output1, intermediate_output)
+        elif activation == "swigluoai" and is_act_and_mul:
+            # alpha = 1.702, limit = 7.0
+            torch.ops._C.swigluoai_and_mul(intermediate_output1, intermediate_output)
+        # Activation function without multiplication
+        elif activation == "silu":
+            intermediate_output1 = torch.nn.functional.silu(intermediate_output)
+        elif activation == "gelu":
+            intermediate_output1 = torch.nn.functional.gelu(intermediate_output)
+        else:
+            raise ValueError(f"Unsupported FusedMoe activation: {activation}, "
+                            f"with is_act_and_mul={is_act_and_mul}.")
+        
+        output = self.flux_rs_op.forward_gather_rs(
+                input=intermediate_output1,
+                weight=w2,
+                splits_cpu=splits_cpu,
+                routing_idx=scatter_index.flatten(),
+                output_vec_scale=output_vec_scales,
+            )
+        return output
 
 def fused_moe(
     hidden_states: torch.Tensor,

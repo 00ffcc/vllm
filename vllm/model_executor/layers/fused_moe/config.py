@@ -308,6 +308,7 @@ class FusedMoEConfig:
     num_experts: int
     experts_per_token: int
     hidden_dim: int
+    intermediate_size: int = 0 # for flux fused experts
 
     num_local_experts: int
     moe_parallel_config: FusedMoEParallelConfig

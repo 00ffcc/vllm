@@ -40,9 +40,8 @@ from vllm.utils import (direct_register_custom_op, has_deep_ep, has_pplx,
 
 if current_platform.is_cuda_alike():
     from .fused_batched_moe import BatchedTritonExperts
-    from .fused_moe import TritonExperts
-    #from .fused_moe import fused_experts
-    from .fused_moe import flux_fused_experts as fused_experts
+    from .fused_moe import TritonExperts, fused_experts
+    from .fused_moe import FluxFusedExperts
     if has_pplx():
         from .pplx_prepare_finalize import (PplxPrepareAndFinalize,
                                             pplx_hidden_dim_scale_bytes)
@@ -204,6 +203,22 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     # prepare_communication_buffer_for_model.
     def init_prepare_finalize(self, layer: torch.nn.Module):
         assert self.moe is not None
+
+        ##########################################
+        # init flux fused experts
+        ##########################################
+        print(f"init_prepare_finalize: {self.moe=}")
+        self.fused_experts = FluxFusedExperts(
+            global_num_experts=self.moe.num_experts,
+            top_k_num=self.moe.experts_per_token,
+            max_num_tokens=self.moe.max_num_tokens,
+            hidden_size=self.moe.hidden_dim,
+            intermediate_size=self.moe.intermediate_size,
+            dtype=self.moe.in_dtype, # TODO: out?
+        )
+
+        return # TODO
+
         prepare_finalize = self.maybe_make_prepare_finalize(self.moe)
 
         if prepare_finalize is not None:
@@ -484,7 +499,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count)
         
-        self.fused_experts = None # enforce flux fused moe
 
         if self.rocm_aiter_moe_enabled:
             return self.rocm_aiter_fused_experts(
@@ -884,6 +898,7 @@ class FusedMoE(CustomOp):
         moe = FusedMoEConfig.make(num_experts=self.global_num_experts,
                                   experts_per_token=top_k,
                                   hidden_dim=hidden_size,
+                                  intermediate_size=intermediate_size,
                                   num_local_experts=self.local_num_experts,
                                   moe_parallel_config=self.moe_parallel_config,
                                   in_dtype=model_dtype,
