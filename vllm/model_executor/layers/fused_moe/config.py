@@ -308,7 +308,6 @@ class FusedMoEConfig:
     num_experts: int
     experts_per_token: int
     hidden_dim: int
-    intermediate_size: int = 0 # for flux fused experts
 
     num_local_experts: int
     moe_parallel_config: FusedMoEParallelConfig
@@ -321,6 +320,8 @@ class FusedMoEConfig:
     max_num_tokens: int = envs.VLLM_MOE_DP_CHUNK_SIZE
 
     has_bias: bool = False
+
+    intermediate_size: int = 0 # for flux fused experts
 
     def __post_init__(self):
         if self.dp_size > 1:
@@ -420,6 +421,7 @@ class FusedMoEConfig:
         quant_config: Optional[Union[FusedMoEQuantConfig,
                                      QuantizationConfig]] = None,
         has_bias: bool = False,
+        intermediate_size: int = 0,
     ) -> "FusedMoEConfig":
 
         _quant_config: Optional[FusedMoEQuantConfig] = None
@@ -495,4 +497,5 @@ class FusedMoEConfig:
             quant_config=_quant_config,
             max_num_tokens=max_num_tokens,
             has_bias=has_bias,
+            intermediate_size=intermediate_size,
         )

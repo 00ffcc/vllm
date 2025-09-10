@@ -1731,8 +1731,9 @@ class FluxFusedExperts(torch.nn.Module):
         intermediate_size,
         dtype,
     ):
+        max_num_tokens=16384 # TODO
         super().__init__()
-
+        print(f"{global_num_experts=} {top_k_num=} {max_num_tokens=} {hidden_size=} {intermediate_size=} {dtype=}")
         import flux
         from vllm.distributed.parallel_state import get_dp_group, get_tp_group, get_ep_group
 
@@ -1815,7 +1816,7 @@ class FluxFusedExperts(torch.nn.Module):
         w1: [num_experts, 2 * intermediate_size_per_partition, hidden_size] (w13)
         w2: [num_experts, hidden_size, intermediate_size_per_partition]
         """
-
+        print(f"{w1.shape=} {w2.shape=} {hidden_states.shape=}")
         
         # Check constraints.
         assert hidden_states.size(1) == w1.size(2), (
@@ -1828,7 +1829,7 @@ class FluxFusedExperts(torch.nn.Module):
         assert hidden_states.dtype in [
             torch.float32, torch.float16, torch.bfloat16
         ]
-        assert intermediate_size == True, "intermediate_size must be True"
+        assert is_act_and_mul == True, "is_act_and_mul must be True"
         #assert inplace == False, "Flux fused_moe only supports outplace mode for now."
 
         num_tokens = hidden_states.size(0)

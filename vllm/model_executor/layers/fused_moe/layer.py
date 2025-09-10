@@ -898,13 +898,14 @@ class FusedMoE(CustomOp):
         moe = FusedMoEConfig.make(num_experts=self.global_num_experts,
                                   experts_per_token=top_k,
                                   hidden_dim=hidden_size,
-                                  intermediate_size=intermediate_size,
                                   num_local_experts=self.local_num_experts,
                                   moe_parallel_config=self.moe_parallel_config,
                                   in_dtype=model_dtype,
                                   max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
                                   quant_config=quant_config,
-                                  has_bias=has_bias)
+                                  has_bias=has_bias,
+                                  intermediate_size=intermediate_size,
+                                  )
         self.moe_config = moe
         self.quant_config = quant_config
 
