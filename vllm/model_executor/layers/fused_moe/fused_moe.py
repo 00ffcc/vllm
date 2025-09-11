@@ -1722,6 +1722,14 @@ def fused_experts_impl(
 
 class FluxFusedExperts(torch.nn.Module):
 
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(FluxFusedExperts, cls).__new__(cls)
+        return cls._instance
+
     def __init__(
         self,
         global_num_experts,
@@ -1731,6 +1739,11 @@ class FluxFusedExperts(torch.nn.Module):
         intermediate_size,
         dtype,
     ):
+        if not self._initialized:
+            self._initialized = True
+        else:
+            return
+        
         max_num_tokens=16384 # TODO
         super().__init__()
         print(f"{global_num_experts=} {top_k_num=} {max_num_tokens=} {hidden_size=} {intermediate_size=} {dtype=}")
