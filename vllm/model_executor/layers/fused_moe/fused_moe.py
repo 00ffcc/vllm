@@ -1744,7 +1744,7 @@ class FluxFusedExperts(torch.nn.Module):
         else:
             return
         
-        max_num_tokens=16384 # TODO
+        max_num_tokens=32768 # TODO
         super().__init__()
         print(f"{global_num_experts=} {top_k_num=} {max_num_tokens=} {hidden_size=} {intermediate_size=} {dtype=}")
         import flux

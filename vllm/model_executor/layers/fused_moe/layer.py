@@ -218,7 +218,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         )
 
         return # TODO
-
+        self.fused_experts = None # TODO
         prepare_finalize = self.maybe_make_prepare_finalize(self.moe)
 
         if prepare_finalize is not None:
