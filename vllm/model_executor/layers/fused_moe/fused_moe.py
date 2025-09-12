@@ -1861,7 +1861,7 @@ class FluxFusedExperts(torch.nn.Module):
         global_topk_ids = self.dp_group.all_gather(topk_ids, dim=0)
         global_topk_weights = self.dp_group.all_gather(topk_weights, dim=0)
 
-        splits_gpu = torch.bincount(global_topk_ids.view(-1), minlength=global_num_experts).to(torch.int32)
+        splits_gpu = torch.zeros(global_num_experts, dtype=torch.int32, device=global_topk_ids.device).scatter_add_(0, global_topk_ids.view(-1), torch.ones_like(global_topk_ids.view(-1)))
         splits_cpu = splits_gpu.cpu()
         import flux
         scatter_index = flux.calc_scatter_index(global_topk_ids, splits_gpu)
