@@ -1720,10 +1720,12 @@ def fused_experts_impl(
 
     return out_hidden_states
 
+import flux
 class FluxFusedExperts(torch.nn.Module):
 
     _instance = None
     _initialized = False
+    _num_layers = 0
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -1738,7 +1740,9 @@ class FluxFusedExperts(torch.nn.Module):
         hidden_size,
         intermediate_size,
         dtype,
+        device,
     ):
+        self._num_layers += 1
         if not self._initialized:
             self._initialized = True
         else:
@@ -1746,7 +1750,6 @@ class FluxFusedExperts(torch.nn.Module):
         
         max_num_tokens=32768 # TODO
         super().__init__()
-        print(f"{global_num_experts=} {top_k_num=} {max_num_tokens=} {hidden_size=} {intermediate_size=} {dtype=}")
         import flux
         from vllm.distributed.parallel_state import get_dp_group, get_tp_group, get_ep_group
 
@@ -1794,7 +1797,10 @@ class FluxFusedExperts(torch.nn.Module):
             ep_size,
             1,
         )
-        
+        self.hidden_states_buf = torch.empty((8192, hidden_size), dtype=torch.bfloat16, device=device)
+        self.topk_weights_buf = torch.empty((8192, top_k_num), dtype=torch.float32, device=device)
+        self.topk_ids_buf = (torch.arange(8192 * top_k_num, device=device, dtype=torch.int32) % global_num_experts).view(8192, top_k_num)
+        self.layer_count = 0
 
     def forward(
         self,
@@ -1829,7 +1835,8 @@ class FluxFusedExperts(torch.nn.Module):
         w1: [num_experts, 2 * intermediate_size_per_partition, hidden_size] (w13)
         w2: [num_experts, hidden_size, intermediate_size_per_partition]
         """
-        print(f"{w1.shape=} {w2.shape=} {hidden_states.shape=}")
+        torch.cuda.synchronize()
+        print(f"{hidden_states.shape=}")
         
         # Check constraints.
         assert hidden_states.size(1) == w1.size(2), (
@@ -1845,27 +1852,42 @@ class FluxFusedExperts(torch.nn.Module):
         assert is_act_and_mul == True, "is_act_and_mul must be True"
         #assert inplace == False, "Flux fused_moe only supports outplace mode for now."
 
-        num_tokens = hidden_states.size(0)
-        E, N, _ = w1.size()
-        K = w2.size(1)
-        if global_num_experts == -1:
-            global_num_experts = E
-        top_k_num = topk_ids.size(1)
-        # We execute the fused_moe kernel in chunks to circumvent this issue:
-        # https://github.com/vllm-project/vllm/issues/5938
-        M = num_tokens
+        original_num_tokens = hidden_states.size(0)
+        #if self.layer_count == 0:
+            # flux all_gather 不能支持每个rank的num_tokens不同，所以这里需要把num_tokens pad到所有ranks中的最大值
+        torch.cuda.synchronize()
+        all_num_tokens = self.dp_group.all_gather(torch.tensor([original_num_tokens], device=hidden_states.device, dtype=torch.float32), dim=0)
+        max_num_tokens = int(all_num_tokens.max())
+        #max_num_tokens = 8192
+        #max_num_tokens = self.max_num_tokens
+        self.layer_count = (self.layer_count + 1) % self._num_layers
+        torch.cuda.synchronize()
+        print(f"{self.layer_count=} {max_num_tokens=} {topk_weights.dtype=} {topk_ids.dtype=} {hidden_states.dtype=}")
+        self.hidden_states_buf[:original_num_tokens, :].copy_(hidden_states)
+        hidden_states = self.hidden_states_buf[:max_num_tokens, :].contiguous()
+        self.topk_weights_buf[:original_num_tokens, :].copy_(topk_weights)
+        topk_weights = self.topk_weights_buf[:max_num_tokens, :]
+        self.topk_ids_buf[:original_num_tokens, :].copy_(topk_ids)
+        topk_ids = self.topk_ids_buf[:max_num_tokens, :]
 
         intermediate_size_per_partition = w2.size(2)
         assert intermediate_size_per_partition == w1.size(1) // (2 if is_act_and_mul else 1), f"intermediate_size_per_partition mismatch. {intermediate_size_per_partition=} {w1.shape=} {w2.shape=}"
-        
-        global_topk_ids = self.dp_group.all_gather(topk_ids, dim=0)
+       
+        torch.cuda.synchronize()
+        print(f"{topk_ids.shape=}")
+        global_topk_ids = self.dp_group.all_gather(topk_ids.to(torch.float32), dim=0).to(torch.int32)
+        #global_topk_ids = torch.empty((self.dp_group.world_size, max_num_tokens, topk_ids.size(-1)), dtype=topk_ids.dtype, device=topk_ids.device)
+        #torch.distributed.all_gather_into_tensor(global_topk_ids, topk_ids)
+        #global_topk_ids = global_topk_ids.view(-1, topk_ids.size(-1))
+        torch.cuda.synchronize()
+        print(f"{global_topk_ids.shape=}")
         global_topk_weights = self.dp_group.all_gather(topk_weights, dim=0)
-
+        torch.cuda.synchronize()
         splits_gpu = torch.zeros(global_num_experts, dtype=torch.int32, device=global_topk_ids.device).scatter_add_(0, global_topk_ids.view(-1), torch.ones_like(global_topk_ids.view(-1)))
-        splits_cpu = splits_gpu.cpu()
-        import flux
+        splits_cpu = splits_gpu.to("cpu")
+        torch.cuda.synchronize()
+        print("splits_cpu")
         scatter_index = flux.calc_scatter_index(global_topk_ids, splits_gpu)
-
         device = torch.cuda.current_device()
         data_type = hidden_states.dtype
         nexperts_ep = global_num_experts // self.ep_size
@@ -1876,7 +1898,9 @@ class FluxFusedExperts(torch.nn.Module):
         global_output_vec_scales = torch.zeros((global_topk_ids.numel(),), dtype=global_topk_weights.dtype, device=device)
         global_output_vec_scales.scatter_(0, scatter_index.view(-1), global_topk_weights.view(-1))
         output_vec_scales = global_output_vec_scales[torch.sum(splits_gpu[:nexperts_ep * self.ep_rank]) : torch.sum(splits_gpu[:nexperts_ep * (self.ep_rank + 1)])]
-
+        torch.cuda.synchronize()
+        self.dp_group.barrier()
+        print(f"flux_ag_op {splits_gpu.max().item()=}")
         self.flux_ag_op.forward(
                 inputs_shard=hidden_states,
                 weights=w1,
@@ -1884,6 +1908,8 @@ class FluxFusedExperts(torch.nn.Module):
                 scatter_index=scatter_index,
                 outputs_buf=intermediate_output,
             )
+        torch.cuda.synchronize()
+        print("flux_ag_op finish")
         if activation == "silu" and is_act_and_mul:
             torch.ops._C.silu_and_mul(intermediate_output1, intermediate_output)
         elif activation == "gelu" and is_act_and_mul:
@@ -1899,7 +1925,9 @@ class FluxFusedExperts(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported FusedMoe activation: {activation}, "
                             f"with is_act_and_mul={is_act_and_mul}.")
-        
+        torch.cuda.synchronize()
+        self.dp_group.barrier()
+        print("flux_rs_op") 
         output = self.flux_rs_op.forward_gather_rs(
                 input=intermediate_output1,
                 weight=w2,
@@ -1907,6 +1935,9 @@ class FluxFusedExperts(torch.nn.Module):
                 routing_idx=scatter_index.flatten(),
                 output_vec_scale=output_vec_scales,
             )
+        output = output[:original_num_tokens]
+        torch.cuda.synchronize()
+        print("finish")
         return output
 
 def fused_moe(

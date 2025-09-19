@@ -207,7 +207,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         ##########################################
         # init flux fused experts
         ##########################################
-        print(f"init_prepare_finalize: {self.moe=}")
         self.fused_experts = FluxFusedExperts(
             global_num_experts=self.moe.num_experts,
             top_k_num=self.moe.experts_per_token,
@@ -215,6 +214,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             hidden_size=self.moe.hidden_dim,
             intermediate_size=self.moe.intermediate_size,
             dtype=self.moe.in_dtype, # TODO: out?
+            device=torch.cuda.current_device(),
         )
 
         return # TODO
@@ -1714,6 +1714,7 @@ class FusedMoE(CustomOp):
             self.dp_size > 1
             and not self.moe_parallel_config.use_deepep_ht_kernels
             and not self.moe_config.use_flashinfer_cutlass_kernels)
+        do_naive_dispatch_combine = False # TODO
         if do_naive_dispatch_combine:
             hidden_states, router_logits = get_ep_group().dispatch(
                 hidden_states, router_logits)
